@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+
+import argparse, socket, time, json
+from enum import Enum
+
+BROADCAST = 'FFFF'
+LEADER = 'leader'
+CANDIDATE = 'candidate'
+FOLLOWER = 'follower'
+
+# Message Fields
+SRC = 'src'
+DST = 'dst'
+TYPE = 'type'
+MID = 'MID'
+TERM = "term"
+VALUE = 'value'
+KEY = 'key'
+
+# Message Types
+HELLO = "hello"
+OK = 'ok'
+REDIRECT = 'redirect'
+FAIL = 'fail'
+GET = 'get'
+PUT = 'put'
+APPEND_ENTRY = 'appendEntries'
+YES_VOTE = 'yesVote'
+NO_VOTE = 'noVOte'
+REQUEST_VOTE = 'requestVote'
+CANDIDATE = 'candidate'
+
+# Timeout
+HEARTBEAT_TIMEOUT = 0.5
+ELECTION_TIMEOUT = 2.8
+
+# Represents the role of a replica
+class ReplicaRole(Enum):
+    LEADER = 'leader',
+    CANDIDATE = 'candidate',
+    FOLLOWER = 'follower'
+
+
+# Builder for messages among replicas and clients
+class MessageBuilder:
+
+    # Initialize an instance of this builder
+    def __init__(self, src, dst):
+        self.message = {
+            SRC: src,
+            DST: dst
+        }
+
+    # Override dst in the message
+    def dst(self, newDst):
+        self.message[DST] = newDst
+        return self
+
+    # Add type to the message
+    def type(self, msgType):
+        self.message[TYPE] = msgType
+        return self
+
+    # Add key to the message
+    def key(self, key):
+        self.message[KEY] = key
+        return self
+
+    # Add value to the message
+    def value(self, value):
+        self.message[VALUE] = value
+        return self
+
+    # Add term to the message
+    def term(self, term):
+        self.message[TERM] = term
+        return self
+
+    # Add mid to the message
+    def mid(self, mid):
+        self.message[MID] = mid
+        return self
+
+    # Add leader to the message
+    def leader(self, leader):
+        self.message[LEADER] = leader
+        return self
+
+    # add candidate id to the message
+    def candidateID(self, id):
+        self.message[CANDIDATE] = id
+        return self
+
+    # Convert the message from JSON to serialized String
+    # Returns the message as String
+    def build(self):
+        return json.dumps(self.message)
+
+    # Return a deep copy of the message as a dictionary
+    def buildDict(self):
+        return self.message.copy()
+
+# Represents a replica machine in the RAFT consensus algorithm
+class Replica:
+    def __init__(self, port, id, others):
+        self.port = port
+        self.id = id
+        self.others = others
+
+        self.role = ReplicaRole.FOLLOWER
+        self.term = 0
+        self.votesReceived = 0
+        self.votedTo = ''
+        self.log = []
+        # Initialize Log
+        self.log.append(MessageBuilder('', '').key('').value('').mid('').term(0).buildDict())
+        # Stores the key-value pair provided by put requests
+        self.data = {}
+        self.leader = BROADCAST
+        self.lastSyncTime = time.time()
+
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('localhost', 0))
+
+        print("Replica %s starting up" % self.id, flush=True)
+        helloMessage = MessageBuilder(src=self.id, dst=BROADCAST).leader(BROADCAST).type(HELLO).build()
+        self.send(helloMessage)
+        print("Sent hello message: %s" % helloMessage, flush=True)
+
+    # Send a message to other replicas or the client
+    def send(self, message):
+        self.socket.sendto(message.encode('utf-8'), ('localhost', self.port))
+
+    # send the given message to all replicas
+    def broadcastCluster(self, messageBuilder):
+        for i in range(0, len(self.others)):
+            messageBuilder.dst(self.others[i])
+            self.send(messageBuilder.build())
+
+    # Is this replica a leader?
+    def isLeader(self):
+        return self.role.value == ReplicaRole.LEADER.value and self.leader == self.id
+
+    # Deals with get request
+    def get(self, msg):
+        key = msg[KEY]
+
+        # add source, destination and leader to the message
+        replyMessage = MessageBuilder(src=self.id, dst=msg[SRC])
+        replyMessage.leader(self.leader).mid(msg[MID])
+
+        # if this replica is a leader
+        if self.isLeader():
+            if key in self.data.keys():
+                # fetch the value that maps to the provided key
+                replyMessage.type(OK) \
+                    .value(self.data[key])
+            else:
+                # tell the client to try again later
+                replyMessage.type(FAIL)
+        # if this replica is a follower
+        else:
+            # redirect the client to contact the cluster leader
+            replyMessage.type(REDIRECT)
+
+        self.send(replyMessage.build())
+
+    # Leader logs a put operation
+    def leaderPutLog(self, msg):
+        logMessage = MessageBuilder(src=self.id, dst='') \
+            .key(msg[KEY]) \
+            .value(msg[VALUE]) \
+            .mid(msg[MID]) \
+            .term(self.term)
+        self.log.append(logMessage.buildDict())
+
+    # Broadcast appendEntry from the leader to all replicas
+    def broadcastAppendEntry(self, msg):
+        appendEntriesMessageBuilder = \
+            MessageBuilder(src=self.id, dst=None) \
+                .leader(self.leader) \
+                .type(APPEND_ENTRY) \
+                .mid(msg[MID]) \
+                .key(msg[KEY]) \
+                .value(msg[VALUE])
+
+        self.broadcastCluster(appendEntriesMessageBuilder)
+        self.broadcastCluster(appendEntriesMessageBuilder)
+
+    # Start an election to elect the new cluster leader
+    def runElection(self):
+        self.term += 1
+        self.role = ReplicaRole.CANDIDATE
+        self.votedTo = self.id
+        # Vote for self
+        self.votesReceived += 1
+
+        requestVoteMessage = MessageBuilder(src=self.id, dst=None) \
+            .leader(self.leader) \
+            .type(REQUEST_VOTE) \
+            .term(self.term) \
+            .candidateID(self.id)
+        self.broadcastCluster(requestVoteMessage)
+
+    # Handle put when the current role is leader
+    def leaderPut(self, msg):
+        # store this operation in the log
+        self.data[msg[KEY]] = msg[VALUE]
+        # leader logs this put operation
+        self.leaderPutLog(msg)
+        # append entries
+        self.broadcastAppendEntry(msg)
+
+        # Respond with OK
+        putMessage = MessageBuilder(src=self.id, dst=msg[SRC]) \
+            .leader(self.leader) \
+            .type(OK) \
+            .mid(msg[MID])
+        self.send(putMessage.build())
+
+    # Deals with put request
+    def put(self, msg):
+        if self.isLeader():
+            self.leaderPut(msg)
+        else:
+            if self.leader == BROADCAST:
+                self.runElection()
+            else:
+                redirectMessage = MessageBuilder(src=self.id, dst=msg[SRC]) \
+                    .leader(self.leader) \
+                    .type(REDIRECT) \
+                    .mid(msg[MID])
+                self.send(redirectMessage.build())
+
+    # Requests vote from all other replicas
+    def requestVote(self, msg):
+        requestVoteMessage = \
+            MessageBuilder(src=self.id, dst=msg[SRC]) \
+                .leader(self.leader) \
+                .term(self.term)
+
+        # Vote yes if never voted
+        if self.votedTo == '':
+            requestVoteMessage.type(YES_VOTE)
+            self.votedTo = self.id
+        # Vote no if already voted
+        else:
+            requestVoteMessage.type(NO_VOTE)
+        self.send(requestVoteMessage.build())
+
+    # Are the votes received enough for an candidate to become a leader?
+    def receivedEnoughVotes(self):
+        return self.votesReceived >= len(self.others) / 2
+
+    # Send empty AppendEntry to all replicas
+    def broadcastHeartbeat(self):
+        for replicaID in self.others:
+            appendEntryMessage = \
+                MessageBuilder(src=self.id, dst=replicaID) \
+                    .type(APPEND_ENTRY) \
+                    .leader(self.leader) \
+                    .term(self.term) \
+                    .key('') \
+                    .value('') \
+
+            self.send(appendEntryMessage.build())
+
+    # When received a vote from other replicas,
+    # determine whether to transition from a candidate
+    # to a leader
+    def receivedVote(self, msg):
+        self.votesReceived += 1
+
+        # if the current replica received votes for more than half of other replicas
+        if self.receivedEnoughVotes():
+            self.leader = self.id
+            self.role = ReplicaRole.LEADER
+
+            # reset vote received
+            self.votesReceived = 0
+            if self.isLeader():
+                self.broadcastHeartbeat()
+      
+    # after a leader is elected, reset everything for election            
+    def resetElection(self, newLeader):
+        self.votesReceived = 0
+        self.votedTo = ''
+        self.leader = newLeader
+
+    # When a candidate didin't receive a vote from other replicas
+    def receivedNoVote(self, msg):
+        termAtMessage = msg[TERM]
+
+        if self.role.value == ReplicaRole.CANDIDATE.value and termAtMessage >= self.term:
+            self.term = termAtMessage
+            self.role = ReplicaRole.FOLLOWER
+
+            self.resetElection(msg[LEADER])
+
+
+    # Processes the appendEntry request
+    def appendEntry(self, msg):
+        self.lastSyncTime = time.time()
+        if msg[KEY] == '' or msg[VALUE] == '':
+            # send heartbeat message
+            self.votedTo = ''
+            if self.leader == BROADCAST or not self.leader == msg[LEADER]:
+                self.leader = msg[LEADER]
+        else:
+            self.data[msg[KEY]] = msg[VALUE]
+    
+    # Start running this replica
+    def run(self):
+        try:
+            commands = {
+                GET: self.get,
+                PUT: self.put,
+                REQUEST_VOTE: self.requestVote,
+                YES_VOTE: self.receivedVote,
+                NO_VOTE: self.receivedNoVote,
+                APPEND_ENTRY: self.appendEntry
+            }
+
+            while True:
+                data, addr = self.socket.recvfrom(65535)
+                msg = json.loads(data.decode('utf-8'))
+
+                print("Received message '%s'" % (msg,), flush=True)
+
+                # the type fo the message : string
+                msgType = msg[TYPE]
+
+                # Execute the corresponding command
+                commands[msgType](msg)
+
+                timeCounter = time.time()
+                timeSpan = timeCounter - self.lastSyncTime
+
+                # if this replica is the leader, send heartbeat
+                if timeSpan > HEARTBEAT_TIMEOUT and self.role.value == ReplicaRole.LEADER.value:
+                    # print("LEADER: " + str(self.id) + " heartbeat")
+                    self.broadcastHeartbeat()
+                    self.lastSyncTime = timeCounter
+                # if this replica is not the leader and find the leader timeout, start election
+                elif timeSpan > ELECTION_TIMEOUT and self.role.value != ReplicaRole.LEADER.value:
+                    # print("Start election")
+                    self.runElection()
+                    self.lastSyncTime = timeCounter
+                else:
+                    # print("ZHI YING NI TAI MEI Baby " + "ID: " + self.id + " Role: " + str(self.role.value) + "Time span: " + str(timeSpan))
+                    pass
+                
+        except Exception as e:
+            print("***** An unknown exception occured *****")
+            print(e.message)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='run a key-value store')
+    parser.add_argument('port', type=int, help="Port number to communicate")
+    parser.add_argument('id', type=str, help="ID of this replica")
+    parser.add_argument('others', metavar='others', type=str, nargs='+', help="IDs of other replicas")
+    args = parser.parse_args()
+    replica = Replica(args.port, args.id, args.others)
+    replica.run()
